@@ -63,25 +63,50 @@ bool fs_init(void)
                                               true);
     filesystem_t *fat = filesystem_fat_create();
     int err = fs_mount("/", fat, sd);
-    if (err == -1)
+    int err = fs_mount(root, fat, sd);
+	if (err != -1)
+	{
+		DEBUG_PRINT("Mounted SD card at %s\n", root);
+		return true;
+	}
+
+	err = fs_format(fat, sd);
+	if (err == -1)
+	{
+		DEBUG_PRINT("Format err: Failed to format SD card\n");
+		return false;
+	}
+
+	err = fs_mount(root, fat, sd);
+	if (err == -1)
+	{
+		DEBUG_PRINT("Mount err: Failed to mount SD card at %s\n", root);
+		return false;
+	}
+	DEBUG_PRINT("Mounted SD card at %s\n", root);
+    return true;
+}
+// Check if a valid application exists in flash by examining the vector table
+static bool is_valid_application(uint32_t *app_location)
+{
+    // Check that the initial stack pointer is within a plausible RAM region.
+	// Assumed range for Pico: 0x20000000 to 0x20040000 + SCRACH_X + SCRATCH_Y
+	// or 0x20000000 to 0x20041FFF
+    uint32_t stack_pointer = app_location[0];
+	
+    if (stack_pointer < 0x20000000 || stack_pointer > MAX_RAM + (2*4*1024) - 1) // MAX_RAM + 8KB for scratch regions
     {
-        DEBUG_PRINT("format /\n");
-        err = fs_format(fat, sd);
-        if (err == -1)
-        {
-            DEBUG_PRINT("format err: %s\n", strerror(errno));
-            return false;
-        }
-        err = fs_mount("/", fat, sd);
-        if (err == -1)
-        {
-            DEBUG_PRINT("mount err: %s\n", strerror(errno));
-            return false;
-        }
+        return false;
+    }
+
+    // Check that the reset vector is within the valid flash application area
+    uint32_t reset_vector = app_location[1];
+    if (reset_vector < (0x10000000 + SD_BOOT_FLASH_OFFSET) || reset_vector > (0x10000000 + PICO_FLASH_SIZE_BYTES))
+    {
+        return false;
     }
     return true;
 }
-
 static bool __not_in_flash_func(is_same_existing_program)(FILE *fp)
 {
     uint8_t buffer[FLASH_SECTOR_SIZE] = {0};
@@ -106,13 +131,9 @@ static bool __not_in_flash_func(load_program)(const char *filename)
         DEBUG_PRINT("open %s fail: %s\n", filename, strerror(errno));
         return false;
     }
-    if (is_same_existing_program(fp))
-    {
-        // Program is up to date
-    }
 
     // Check file size to ensure it doesn't exceed the available flash space
-    if (fseek(fp, 0, SEEK_END) == -1)
+    if (fseek(fp, 0, SEEK_END) != 0)
     {
         DEBUG_PRINT("seek err: %s\n", strerror(errno));
         fclose(fp);
@@ -120,7 +141,7 @@ static bool __not_in_flash_func(load_program)(const char *filename)
     }
 
     long file_size = ftell(fp);
-    if (file_size <= 0)
+    if (file_size <= 0) // File should not be 0 since we set the pointer to SEEK_END earlier
     {
         DEBUG_PRINT("invalid size: %ld\n", file_size);
         fclose(fp);
@@ -135,13 +156,21 @@ static bool __not_in_flash_func(load_program)(const char *filename)
     }
 
     DEBUG_PRINT("updating: %ld bytes\n", file_size);
-    if (fseek(fp, 0, SEEK_SET) == -1)
+    if (fseek(fp, 0, SEEK_SET) != 0)
     {
         DEBUG_PRINT("seek err: %s\n", strerror(errno));
         fclose(fp);
         return false;
     }
 
+	// Only check validity after verifying we can use this pointer
+    if ( is_same_existing_program(fp) && is_valid_application((uint32_t*)(XIP_BASE + SD_BOOT_FLASH_OFFSET)) )
+    {
+		DEBUG_PRINT("Same program exists validly in flash, skipping work\n");
+		fclose(fp);
+        return true;
+    }
+	
     size_t program_size = 0;
     uint8_t buffer[FLASH_SECTOR_SIZE] = {0};
     size_t len = 0;
@@ -185,25 +214,7 @@ void __not_in_flash_func(launch_application_from)(uint32_t *app_location)
         :);
 }
 
-// Check if a valid application exists in flash by examining the vector table
-static bool is_valid_application(uint32_t *app_location)
-{
-    // Check that the initial stack pointer is within a plausible RAM region (assumed range for Pico: 0x20000000 to 0x20040000)
-    uint32_t stack_pointer = app_location[0];
-	
-    if (stack_pointer < 0x20000000 || stack_pointer > MAX_RAM + 2*4*1024) // MAX_RAM + 8KB
-    {
-        return false;
-    }
 
-    // Check that the reset vector is within the valid flash application area
-    uint32_t reset_vector = app_location[1];
-    if (reset_vector < (0x10000000 + SD_BOOT_FLASH_OFFSET) || reset_vector > (0x10000000 + PICO_FLASH_SIZE_BYTES))
-    {
-        return false;
-    }
-    return true;
-}
 
 void boot_default()
 {
